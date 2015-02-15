@@ -3,9 +3,8 @@
  *
  * Copyright (C) 2003-2008 Alan Stern
  * Copyeight (C) 2009 Samsung Electronics
- * Copyright (C) 2011-2012 Sony Ericsson Mobile Communications AB.
- * Copyright (C) 2012 Sony Mobile Communications AB.
  * Author: Michal Nazarewicz (mina86@mina86.com)
+ * Copyright (C) 2012-2013 Sony Mobile Communications AB.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -179,12 +178,17 @@ struct interrupt_data {
 #define SS_UNRECOVERED_READ_ERROR		0x031100
 #define SS_WRITE_ERROR				0x030c02
 #define SS_WRITE_PROTECTED			0x072700
+#define SS_BECOMING_READY			0x020401
 
 #define SK(x)		((u8) ((x) >> 16))	/* Sense Key byte, etc. */
 #define ASC(x)		((u8) ((x) >> 8))
 #define ASCQ(x)		((u8) (x))
 
+
 #define RANDOM_WRITE_COUNT_TO_BE_FLUSHED (15)
+#define BECOMING_READY_COUNT			1
+#define NOT_READY_TO_READY_TRANSITION_COUNT	10
+
 /* VPD(Vital product data) Page Name */
 #define VPD_SUPPORTED_VPD_PAGES		0x00
 #define VPD_UNIT_SERIAL_NUMBER		0x80
@@ -199,6 +203,8 @@ struct fsg_lun {
 	loff_t		num_sectors;
 
 	u8		random_write_count;
+	atomic_t	wait_for_mount;
+	u8		wait_for_mount_count;
 	loff_t		last_offset;
 
 	unsigned int	initially_ro:1;
@@ -787,7 +793,6 @@ static void store_cdrom_address(u8 *dest, int msf, u32 addr)
 {
 	if (msf) {
 		/* Convert to Minutes-Seconds-Frames */
-		addr >>= 2;		/* Convert to 2048-byte frames */
 		addr += 2*75;		/* Lead-in occupies 2 seconds */
 		dest[3] = addr % 75;	/* Frames */
 		addr /= 75;
@@ -821,6 +826,14 @@ static ssize_t fsg_show_nofua(struct device *dev, struct device_attribute *attr,
 	struct fsg_lun	*curlun = fsg_lun_from_dev(dev);
 
 	return sprintf(buf, "%u\n", curlun->nofua);
+}
+
+static ssize_t fsg_show_cdrom (struct device *dev, struct device_attribute *attr,
+			   char *buf)
+{
+	struct fsg_lun  *curlun = fsg_lun_from_dev(dev);
+
+	return sprintf(buf, "%d\n", curlun->cdrom);
 }
 
 #ifdef CONFIG_USB_MSC_PROFILING
@@ -986,9 +999,39 @@ static ssize_t fsg_store_file(struct device *dev, struct device_attribute *attr,
 				curlun->lun_filename[count] = '\0';
 				curlun->unit_attention_data =
 					SS_NOT_READY_TO_READY_TRANSITION;
+				atomic_set(&curlun->wait_for_mount, 0);
 			}
 		}
 	}
 	up_write(filesem);
 	return (rc < 0 ? rc : count);
+}
+
+static ssize_t fsg_store_cdrom(struct device *dev, struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	ssize_t    rc;
+	struct fsg_lun  *curlun = fsg_lun_from_dev(dev);
+	struct rw_semaphore  *filesem = dev_get_drvdata(dev);
+	unsigned  cdrom;
+
+	rc = kstrtouint(buf, 2, &cdrom);
+	if (rc)
+		return rc;
+
+	/*
+	 * Allow the cdrom status to change only while the
+	 * backing file is closed.
+	 */
+	down_read(filesem);
+	if (fsg_lun_is_open(curlun)) {
+		LDBG(curlun, "cdrom status change prevented\n");
+		rc = -EBUSY;
+	} else {
+		curlun->cdrom = cdrom;
+		LDBG(curlun, "cdrom status set to %d\n", curlun->cdrom);
+		rc = count;
+	}
+	up_read(filesem);
+	return rc;
 }

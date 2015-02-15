@@ -3,6 +3,7 @@
  * Show Logo in RLE 565 format
  *
  * Copyright (C) 2008 Google Incorporated
+ * Copyright (C) 2013 Sony Mobile Communications AB.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -14,12 +15,14 @@
  * GNU General Public License for more details.
  *
  */
+#include <asm/cacheflush.h>
 #include <linux/module.h>
 #include <linux/types.h>
 #include <linux/fb.h>
 #include <linux/vt_kern.h>
 #include <linux/unistd.h>
 #include <linux/syscalls.h>
+#include <linux/workqueue.h>
 
 #include <linux/irq.h>
 #include <asm/system.h>
@@ -34,6 +37,16 @@
 #define fb_depth(fb)	((fb)->var.bits_per_pixel >> 3)
 #define fb_size(fb)	(fb_width(fb) * fb_height(fb) * fb_depth(fb))
 #define INIT_IMAGE_FILE "/logo.rle"
+
+static void close_fb_work(struct work_struct *work)
+{
+	struct fb_info *fb_info;
+	struct delayed_work *fb_work = to_delayed_work(work);
+	fb_info = registered_fb[0];
+	if (fb_info && fb_info->fbops->fb_release)
+		fb_info->fbops->fb_release(fb_info, 0);
+	kfree(fb_work);
+}
 
 static void memset16(void *_ptr, unsigned short val, unsigned count)
 {
@@ -99,38 +112,49 @@ int load_565rle_image(char *filename, bool bf_supported)
 		       __func__, __LINE__, info->node);
 		goto err_logo_free_data;
 	}
-	bits = (unsigned char *)(info->screen_base);
-	while (count > 3) {
-		int n = ptr[0];
+	if (info->screen_base) {
+		bits = (unsigned char *)(info->screen_base);
+		while (count > 3) {
+			int n = ptr[0];
 
-		if (n > max)
-			break;
-		max -= n;
-		while (n > 0) {
-			unsigned int j =
-				(line_pos + n > width ? width-line_pos : n);
+			if (n > max)
+				break;
+			max -= n;
+			while (n > 0) {
+				unsigned int j =
+				    (line_pos + n > width ? width-line_pos : n);
 
-			if (fb_depth(info) == 2)
-				memset16(bits, ptr[1], j << 1);
-			else {
-				unsigned int widepixel = ptr[1];
-				widepixel = (widepixel & 0xf800) << (19-11) |
-						(widepixel & 0x07e0) << (10-5) |
-						(widepixel & 0x001f) << (3-0);
-				memset32(bits, widepixel, j << 2);
+				if (fb_depth(info) == 2)
+					memset16(bits, swab16(ptr[1]), j << 1);
+				else {
+					unsigned int widepixel = ptr[1];
+					/*
+					 * Format is RGBA, but fb is big
+					 * endian so we should make widepixel
+					 * as ABGR.
+					 */
+					widepixel =
+						/* red :   f800 -> 000000f8 */
+						(widepixel & 0xf800) >> 8 |
+						/* green : 07e0 -> 0000fc00 */
+						(widepixel & 0x07e0) << 5 |
+						/* blue :  001f -> 00f80000 */
+						(widepixel & 0x001f) << 19;
+					memset32(bits, widepixel, j << 2);
+				}
+				bits += j * fb_depth(info);
+				line_pos += j;
+				n -= j;
+				if (line_pos == width) {
+					bits += (stride-width) * fb_depth(info);
+					line_pos = 0;
+				}
 			}
-			bits += j * fb_depth(info);
-			line_pos += j;
-			n -= j;
-			if (line_pos == width) {
-				bits += (stride-width) * fb_depth(info);
-				line_pos = 0;
-			}
+			ptr += 2;
+			count -= 4;
 		}
-		ptr += 2;
-		count -= 4;
+		dmac_flush_range(info->screen_base, bits);
 	}
-
 err_logo_free_data:
 	kfree(data);
 err_logo_close_file:
@@ -142,12 +166,19 @@ err_logo_close_file:
 static void __init draw_logo(void)
 {
 	struct fb_info *fb_info;
-
+	struct delayed_work *fb_work;
 	fb_info = registered_fb[0];
 	if (fb_info && fb_info->fbops->fb_open) {
 		printk(KERN_INFO "Drawing logo.\n");
 		fb_info->fbops->fb_open(fb_info, 0);
 		fb_info->fbops->fb_pan_display(&fb_info->var, fb_info);
+		fb_work = kmalloc(sizeof(struct delayed_work), GFP_KERNEL);
+		if (fb_work == NULL) {
+			printk(KERN_ERR"%s failed for kmalloc\n", __func__);
+		} else {
+			INIT_DELAYED_WORK(fb_work, close_fb_work);
+			schedule_delayed_work(fb_work, HZ*5);
+		}
 	}
 }
 
